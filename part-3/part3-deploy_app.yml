@@ -1,0 +1,46 @@
+---
+- name: Deploy Docker Compose application with secrets
+  hosts: ec2_1
+  become: true
+
+  vars_files:
+    - ../group_vars/vault.yml
+
+  vars:
+    project_path: /opt/todo-app
+
+  tasks:
+    - name: Log in to GitHub Container Registry
+      community.docker.docker_login:
+        registry_url: ghcr.io
+        username: "{{ REGISTRY_USER }}"
+        password: "{{ REGISTRY_PASSWORD }}"
+      tags:
+        - docker_login
+
+    - name: Create project directory on remote host
+      ansible.builtin.file:
+        path: "{{ project_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: Create .env file from vault
+      ansible.builtin.template:
+        src: templates/.env.j2
+        dest: "{{ project_path }}/.env"
+        mode: "0600"
+      tags:
+        - deploy_app
+
+    - name: Copy compose file to remote host
+      ansible.builtin.copy:
+        src: part3-compose.yaml
+        dest: "{{ project_path }}/compose.yml"
+        mode: "0644"
+
+    - name: Deploy application from Docker Compose file
+      community.docker.docker_compose_v2:
+        project_name: todo-app
+        project_src: "{{ project_path }}"
+      tags:
+        - deploy_app

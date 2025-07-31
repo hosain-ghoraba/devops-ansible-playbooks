@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: to-do-app
+  namespace: argocd
+  annotations:
+    argocd-image-updater.argoproj.io/image-list: myimage=ghcr.io/hosain-ghoraba/todo-list-nodejs
+    argocd-image-updater.argoproj.io/ghcr.io.secret: ghcr-creds
+    argocd-image-updater.argoproj.io/write-back-method: git
+    argocd-image-updater.argoproj.io/myimage.update-strategy: newest-build
+
+
+
+
+spec:
+  destination:
+    namespace: default
+    server: https://kubernetes.default.svc
+  project: default
+  source:
+    repoURL: https://github.com/hosain-ghoraba/devops-ansible-playbooks
+    targetRevision: HEAD
+    path: part-4/todo-list-k8s-manifests
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

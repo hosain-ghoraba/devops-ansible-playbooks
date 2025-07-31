@@ -1,0 +1,274 @@
+- name: Install k3s and deploy GHCR private image on EC2
+  hosts: ec2_2
+  become: true
+  vars_files:
+    - ../group_vars/vault.yml
+  vars:
+    ghcr_image: "ghcr.io/{{ REGISTRY_USER }}/todo-list-nodejs:main"
+    k8s_app_name: "to-do-app"
+    container_port: "{{ CONTAINER_PORT }}"
+    node_port: "{{ NODE_PORT }}"
+    mongo_uri: "{{ mongoDbUrl }}"
+    app_port: "{{ app_port }}"
+    github_email: "{{ GITHUB_EMAIL }}"
+
+    # region install kubernetes
+  tasks:
+    - name: Install curl
+      ansible.builtin.apt:
+        name: curl
+        state: present
+        update_cache: true
+
+    - name: Download k3s install script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /tmp/k3s_install.sh
+        mode: "0755"
+    - name: Install k3s (single node)
+      ansible.builtin.command: sh /tmp/k3s_install.sh
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Ensure .kube directory exists
+      ansible.builtin.file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        mode: "0700"
+
+    - name: Copy kubeconfig to user home
+      ansible.builtin.copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: /home/ubuntu/.kube/config
+        owner: ubuntu
+        mode: "0600"
+        remote_src: true
+
+    - name: Replace server IP in kubeconfig with localhost
+      ansible.builtin.replace:
+        path: /home/ubuntu/.kube/config
+        regexp: "server: https://127.0.0.1:[0-9]+"
+        replace: "server: https://127.0.0.1:6443"
+
+    - name: Ensure /etc/apt/keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Kubernetes apt repository GPG key (ASCII format)
+      ansible.builtin.get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: "0644"
+
+    - name: Add Kubernetes apt repository source (asc key)
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /"
+        state: present
+        filename: kubernetes
+        update_cache: true
+
+    - name: Install kubectl
+      ansible.builtin.apt:
+        name: kubectl
+        state: present
+        update_cache: true
+
+    - name: Wait for k3s node to be ready
+      become: false
+      ansible.builtin.shell: |
+        set -o pipefail
+        kubectl get nodes --no-headers | grep -q ' Ready '
+      args:
+        executable: /bin/bash
+      register: k3s_ready
+      retries: 12
+      delay: 10
+      until: k3s_ready.rc == 0
+      changed_when: false
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+
+    - name: Ensure python3 and pip3 are installed
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-pip
+        state: present
+        update_cache: true
+
+    - name: Install Python dependency for kubernetes.core.k8s
+      ansible.builtin.pip:
+        name: kubernetes
+        executable: pip3
+
+    # endregion
+    # region allow kubernetes to pull from GHCR (used for creating deployments)
+    - name: Create GHCR registry pull secret for kubernetes pods
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: /home/ubuntu/.kube/config
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: ghcr-secret
+            namespace: default
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: >-
+              {{
+                {
+                  'auths': {
+                    'ghcr.io': {
+                      'username': REGISTRY_USER,
+                      'password': REGISTRY_PASSWORD,
+                      'email': github_email,
+                      'auth': (REGISTRY_USER ~ ':' ~ REGISTRY_PASSWORD) | b64encode
+                    }
+                  }
+                }
+                | to_nice_json
+                | b64encode
+              }}
+    # endregion
+    # region install argocd
+    - name: Create argocd namespace
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: /home/ubuntu/.kube/config
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: argocd
+
+    - name: Install Argo CD via manifests
+      become: false
+      ansible.builtin.shell: |
+        kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      args:
+        creates: /tmp/argocd_installed
+      register: argocd_install
+
+    # endregion
+    # region allow argocd to push to ansible repo
+
+    - name: Create Argo CD GitHub repo secret (to be able to push & update image tags)
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: /home/ubuntu/.kube/config
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: devops-ansible-repo
+            namespace: argocd
+            labels:
+              argocd.argoproj.io/secret-type: repository
+          stringData:
+            url: https://github.com/hosain-ghoraba/devops-ansible-playbooks
+            username: "{{ REGISTRY_USER }}"
+            password: "{{ REGISTRY_PASSWORD }}"
+          type: Opaque
+
+    # endregion
+    # region install image updater
+    - name: Install Argo CD Image Updater (STABLE version)
+      ansible.builtin.shell: |
+        kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj-labs/argocd-image-updater/v0.16.0/manifests/install.yaml
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      args:
+        creates: /tmp/argocd_image_updater_installed
+
+    - name: Set ArgoCD Image Updater log level to debug (to see why image updater does not work)
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: argocd-image-updater
+            namespace: argocd
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: argocd-image-updater
+                    args:
+                      - run
+                      - --loglevel=debug
+    #  endregion
+    # region allow both Argo CD and Image Updater to pull from GHCR
+    - name: Create GHCR registry secret for both Argo CD and Image Updater
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: ghcr-creds
+            namespace: argocd
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: >-
+              {{
+                {
+                  'auths': {
+                    'ghcr.io': {
+                      'username': REGISTRY_USER,
+                      'password': REGISTRY_PASSWORD,
+                      'email': github_email,
+                      'auth': (REGISTRY_USER ~ ':' ~ REGISTRY_PASSWORD) | b64encode
+                    }
+                  }
+                }
+                | to_nice_json
+                | b64encode
+              }}
+    # endregion
+    # region copy argocd file & run it
+    - name: Ensure destination directory exists for Argo CD Application manifest
+      ansible.builtin.file:
+        path: /home/ubuntu/devops-ansible/part-4/todo-list-k8s-manifests
+        state: directory
+        owner: ubuntu
+        mode: "0755"
+
+      # region create app secrets in Kubernetes for depolyment.yaml
+    - name: Create Kubernetes Secret for app configuration
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: to-do-app-secrets
+            namespace: default
+          type: Opaque
+          stringData:
+            mongoDbUrl: "{{ mongoDbUrl }}"
+            app_port: "{{ app_port }}"
+    # endregion
+    - name: Copy Argo CD Application manifest to VM
+      ansible.builtin.copy:
+        src: ./todo-list-k8s-manifests/argocd-application.yaml
+        dest: /home/ubuntu/devops-ansible/part-4/todo-list-k8s-manifests/argocd-application.yaml
+        owner: ubuntu
+        mode: "0644"
+
+    - name: Apply Argo CD Application manifest
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        state: present
+        src: /home/ubuntu/devops-ansible/part-4/todo-list-k8s-manifests/argocd-application.yaml
+
+  # endregion

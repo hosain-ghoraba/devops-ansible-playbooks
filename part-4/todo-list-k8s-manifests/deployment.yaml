@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: to-do-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: to-do-app
+  template:
+    metadata:
+      labels:
+        app: to-do-app
+    spec:
+      containers:
+        - name: to-do-app
+          image: ghcr.io/hosain-ghoraba/todo-list-nodejs:sha-f10b1ff 
+          ports:
+            - containerPort: 4000
+          env:
+            - name: mongoDbUrl
+              valueFrom:
+                secretKeyRef:
+                  name: to-do-app-secrets
+                  key: mongoDbUrl
+            - name: port
+              valueFrom:
+                secretKeyRef:
+                  name: to-do-app-secrets
+                  key: app_port
+      imagePullSecrets:
+        - name: ghcr-secret
