@@ -1,3 +1,3 @@
 kustomize:
   images:
-  - ghcr.io/hosain-ghoraba/todo-list-nodejs:sha-56b0de8
+  - ghcr.io/hosain-ghoraba/todo-list-nodejs:sha-f9d880e
